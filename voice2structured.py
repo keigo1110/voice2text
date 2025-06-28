@@ -121,10 +121,10 @@ class GeminiModelConfig:
 class ProcessingConfig:
     """処理設定"""
 
-    chunk_duration_min: int = 30  # 分
-    chunk_duration_max: int = 45  # 分
-    target_tokens: int = 50000
-    hard_token_cap: int = 60000
+    chunk_duration_min: int = 8  # 分（より安全なサイズ）
+    chunk_duration_max: int = 12  # 分（API制限とフィルター回避）
+    target_tokens: int = 15000  # トークン数を削減
+    hard_token_cap: int = 20000  # より厳しい制限
     max_concurrency: int = 3
     rolling_summary_tokens: int = 1000
     retry_max_attempts: int = 5
@@ -720,7 +720,7 @@ class Voice2Structured:
         self, chunk: ChunkMetadata, context: EnhancedContext
     ) -> Dict:
         """
-        単一チャンクの文字起こし処理（要約なし）
+        単一チャンクの文字起こし処理（強化されたエラーハンドリング付き）
 
         Args:
             chunk: チャンクメタデータ
@@ -729,78 +729,166 @@ class Voice2Structured:
         Returns:
             Dict: 文字起こし結果のみ
         """
-        logger.info(f"Processing chunk {chunk.chunk_id}...")
+        logger.info(f"🎵 Processing chunk {chunk.chunk_id} ({chunk.duration:.1f}s)...")
 
-        try:
-            # 音声ファイルをアップロード
-            uploaded_file = genai.upload_file(chunk.file_path)
+        uploaded_file = None
 
-            # ファイルが処理されるまで待機
-            while uploaded_file.state.name == "PROCESSING":
-                await asyncio.sleep(1)
-                uploaded_file = genai.get_file(uploaded_file.name)
+        for attempt in range(self.processing_config.retry_max_attempts):
+            try:
+                # 音声ファイルをアップロード（リトライごとに再アップロード）
+                if uploaded_file:
+                    try:
+                        genai.delete_file(uploaded_file.name)
+                    except:
+                        pass
 
-            if uploaded_file.state.name == "FAILED":
-                raise Exception(f"File upload failed for chunk {chunk.chunk_id}")
+                uploaded_file = genai.upload_file(chunk.file_path)
 
-            # コンテキスト情報を整形
-            context_info = self.format_context_for_prompt(context)
+                # ファイルが処理されるまで待機
+                while uploaded_file.state.name == "PROCESSING":
+                    await asyncio.sleep(1)
+                    uploaded_file = genai.get_file(uploaded_file.name)
 
-            # プロンプト構築（モード別）
-            if self.output_config.mode == "transcript":
-                system_prompt = SYSTEM_PROMPT_TRANSCRIPT_CHUNK.format(
-                    context_info=context_info, chunk_id=chunk.chunk_id
+                if uploaded_file.state.name == "FAILED":
+                    raise Exception(f"File upload failed for chunk {chunk.chunk_id}")
+
+                # コンテキスト情報を整形（リトライ時は簡素化）
+                if attempt > 0:
+                    # リトライ時はコンテキストを簡素化してフィルターを回避
+                    context_info = "前のチャンクからの継続です。"
+                else:
+                    context_info = self.format_context_for_prompt(context)
+
+                # プロンプト構築（モード別、リトライ時は短縮版）
+                if self.output_config.mode == "transcript":
+                    if attempt > 0:
+                        # リトライ時は安全なプロンプト
+                        system_prompt = "音声を正確に文字起こししてください。"
+                        user_prompt = "この音声の内容を文字起こししてください。"
+                    else:
+                        system_prompt = SYSTEM_PROMPT_TRANSCRIPT_CHUNK.format(
+                            context_info=context_info, chunk_id=chunk.chunk_id
+                        )
+                        user_prompt = USER_PROMPT_TRANSCRIPT_CHUNK
+                else:  # lifelog
+                    if attempt > 0:
+                        # リトライ時は安全なプロンプト
+                        system_prompt = (
+                            "日常会話を自然な形でライフログとして記録してください。"
+                        )
+                        user_prompt = "この音声をライフログ形式で記録してください。"
+                    else:
+                        system_prompt = SYSTEM_PROMPT_LIFELOG_CHUNK.format(
+                            context_info=context_info, chunk_id=chunk.chunk_id
+                        )
+                        user_prompt = USER_PROMPT_LIFELOG_CHUNK
+
+                # 生成設定と安全設定を準備（リトライ時は温度を下げる）
+                generation_config = self._prepare_generation_config()
+                if attempt > 0:
+                    generation_config["temperature"] = max(
+                        0.0, generation_config["temperature"] - 0.05 * attempt
+                    )
+
+                safety_settings = self._prepare_safety_settings()
+
+                # 文字起こし実行
+                response = self.model.generate_content(
+                    contents=[
+                        f"System: {system_prompt}" if system_prompt else "",
+                        user_prompt,
+                        uploaded_file,
+                    ],
+                    generation_config=generation_config,
+                    safety_settings=safety_settings,
                 )
-                user_prompt = USER_PROMPT_TRANSCRIPT_CHUNK
-            else:  # lifelog
-                system_prompt = SYSTEM_PROMPT_LIFELOG_CHUNK.format(
-                    context_info=context_info, chunk_id=chunk.chunk_id
+
+                # レスポンスの詳細チェック
+                if not response.candidates:
+                    raise Exception("No candidates in response")
+
+                candidate = response.candidates[0]
+                finish_reason = candidate.finish_reason
+
+                if finish_reason == 2:  # SAFETY
+                    logger.warning(
+                        f"🛡️ Safety filter triggered for chunk {chunk.chunk_id}, attempt {attempt + 1}"
+                    )
+                    if attempt < self.processing_config.retry_max_attempts - 1:
+                        await asyncio.sleep(
+                            self.processing_config.retry_backoff_sec * (2**attempt)
+                        )
+                        continue
+                    else:
+                        # 最後の試行では部分的な結果を生成
+                        transcript = f"[音声チャンク {chunk.chunk_id}: 安全性フィルターにより内容を表示できません]"
+                elif finish_reason == 3:  # RECITATION
+                    logger.warning(f"🔄 Recitation detected for chunk {chunk.chunk_id}")
+                    transcript = f"[音声チャンク {chunk.chunk_id}: 既知のコンテンツが検出されました]"
+                elif finish_reason == 1:  # STOP (正常終了)
+                    transcript = response.text
+                else:
+                    transcript = (
+                        response.text
+                        if hasattr(response, "text")
+                        else f"[音声チャンク {chunk.chunk_id}: 処理が不完全です]"
+                    )
+
+                # 成功時にはファイルを削除
+                if uploaded_file:
+                    try:
+                        genai.delete_file(uploaded_file.name)
+                    except:
+                        pass
+
+                result = {
+                    "chunk_id": chunk.chunk_id,
+                    "transcript": transcript,
+                    "start_time": chunk.start_time,
+                    "end_time": chunk.end_time,
+                    "duration": chunk.duration,
+                    "status": "completed" if finish_reason == 1 else "partial",
+                    "finish_reason": finish_reason,
+                    "attempts": attempt + 1,
+                }
+
+                logger.info(
+                    f"✅ Completed chunk {chunk.chunk_id} (attempt {attempt + 1}, reason: {finish_reason})"
                 )
-                user_prompt = USER_PROMPT_LIFELOG_CHUNK
+                return result
 
-            # 生成設定と安全設定を準備
-            generation_config = self._prepare_generation_config()
-            safety_settings = self._prepare_safety_settings()
+            except Exception as e:
+                error_msg = str(e)
+                logger.warning(
+                    f"⚠️ Attempt {attempt + 1} failed for chunk {chunk.chunk_id}: {error_msg}"
+                )
 
-            # 文字起こし実行（音声の文字化に集中）
-            response = self.model.generate_content(
-                contents=[
-                    f"System: {system_prompt}" if system_prompt else "",
-                    user_prompt,
-                    uploaded_file,
-                ],
-                generation_config=generation_config,
-                safety_settings=safety_settings,
-            )
+                if attempt < self.processing_config.retry_max_attempts - 1:
+                    wait_time = self.processing_config.retry_backoff_sec * (2**attempt)
+                    logger.info(f"🔄 Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    # 最終試行失敗時のクリーンアップ
+                    if uploaded_file:
+                        try:
+                            genai.delete_file(uploaded_file.name)
+                        except:
+                            pass
 
-            transcript = response.text
-
-            # アップロードファイルを削除
-            genai.delete_file(uploaded_file.name)
-
-            result = {
-                "chunk_id": chunk.chunk_id,
-                "transcript": transcript,
-                "start_time": chunk.start_time,
-                "end_time": chunk.end_time,
-                "duration": chunk.duration,
-                "status": "completed",
-            }
-
-            logger.info(f"Completed transcription for chunk {chunk.chunk_id}")
-            return result
-
-        except Exception as e:
-            logger.error(f"Failed to process chunk {chunk.chunk_id}: {e}")
-            return {
-                "chunk_id": chunk.chunk_id,
-                "transcript": "",
-                "start_time": chunk.start_time,
-                "end_time": chunk.end_time,
-                "duration": chunk.duration,
-                "status": "failed",
-                "error": str(e),
-            }
+                    # 致命的でない場合は部分的な結果を返す
+                    logger.error(
+                        f"❌ Final attempt failed for chunk {chunk.chunk_id}: {error_msg}"
+                    )
+                    return {
+                        "chunk_id": chunk.chunk_id,
+                        "transcript": f"[音声チャンク {chunk.chunk_id}: 処理エラーが発生しました]",
+                        "start_time": chunk.start_time,
+                        "end_time": chunk.end_time,
+                        "duration": chunk.duration,
+                        "status": "failed",
+                        "error": error_msg,
+                        "attempts": attempt + 1,
+                    }
 
     def compress_rolling_summary(self, current_summary: str, new_content: str) -> str:
         """
@@ -916,19 +1004,41 @@ class Voice2Structured:
             # ステップ1: 動的チャンク分割
             chunks = self.create_dynamic_chunks(audio_path)
 
-            # ステップ2: チャンクを順次文字起こし（音声処理に集中）
+            # ステップ2: チャンクを順次文字起こし（改善されたプログレス表示付き）
+            total_chunks = len(chunks)
+            completed_count = 0
+            success_count = 0
+            partial_count = 0
+            failed_count = 0
+
+            logger.info(f"📊 Processing {total_chunks} chunks...")
+
             for chunk in chunks:
                 # 既に処理済みのチャンクはスキップ
                 if resume and chunk.chunk_id in state.completed_chunks:
-                    logger.info(f"Skipping already processed chunk {chunk.chunk_id}")
+                    logger.info(f"⏭️ Skipping already processed chunk {chunk.chunk_id}")
+                    completed_count += 1
                     continue
+
+                # プログレス表示
+                progress = (completed_count / total_chunks) * 100
+                logger.info(
+                    f"📈 Progress: {progress:.1f}% ({completed_count}/{total_chunks})"
+                )
 
                 result = await self.process_chunk(chunk, self.context)
                 all_results.append(result)
 
-                # コンテキストを更新（要約なしで基本情報のみ）
+                # 結果の統計を更新
+                completed_count += 1
                 if result["status"] == "completed":
+                    success_count += 1
+                    # コンテキストを更新（要約なしで基本情報のみ）
                     self.update_context_from_result(result, self.context)
+                elif result["status"] == "partial":
+                    partial_count += 1
+                else:
+                    failed_count += 1
 
                 # 処理状態を更新
                 state.completed_chunks.append(chunk.chunk_id)
@@ -938,9 +1048,30 @@ class Voice2Structured:
                 # 定期的にチェックポイント保存（5チャンクごと）
                 if len(state.completed_chunks) % 5 == 0:
                     self.save_checkpoint(state)
+                    logger.info(
+                        f"💾 Checkpoint saved (Success: {success_count}, Partial: {partial_count}, Failed: {failed_count})"
+                    )
 
                 # 次のチャンク処理前の短い待機
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
+
+            # 最終統計の報告
+            success_rate = (
+                (success_count / total_chunks) * 100 if total_chunks > 0 else 0
+            )
+            logger.info(f"🎯 Processing completed!")
+            logger.info(
+                f"   ✅ Success: {success_count}/{total_chunks} ({success_rate:.1f}%)"
+            )
+            logger.info(f"   ⚠️ Partial: {partial_count}/{total_chunks}")
+            logger.info(f"   ❌ Failed: {failed_count}/{total_chunks}")
+
+            if failed_count > total_chunks * 0.5:
+                logger.warning(
+                    "⚠️ High failure rate detected. Consider reviewing chunk size or content."
+                )
+            elif success_rate >= 90:
+                logger.info("🏆 Excellent processing quality!")
 
             # ステップ3: 簡易的なローリング要約を文字起こしから作成
             for result in all_results:
@@ -1031,20 +1162,31 @@ class Voice2Structured:
         return speaker_info
 
     def _generate_transcript_output(self, results: List[Dict]) -> str:
-        """全文文字起こしモードの出力生成"""
+        """全文文字起こしモードの出力生成（品質統計付き）"""
+        # 処理統計の計算
+        total_chunks = len(results)
+        success_chunks = len([r for r in results if r["status"] == "completed"])
+        partial_chunks = len([r for r in results if r["status"] == "partial"])
+        failed_chunks = len([r for r in results if r["status"] == "failed"])
+        success_rate = (success_chunks / total_chunks * 100) if total_chunks > 0 else 0
+
         content = f"""# 音声文字起こし
 
 ## 処理情報
 - 処理日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 - モデル: {self.model_config.name}
-- チャンク数: {len(results)}
+- チャンク数: {total_chunks}
 - 処理モード: 全文文字起こし
 - 識別された話者数: {len(self.context.speaker_mapping)}
+- 処理品質: ✅成功 {success_chunks}, ⚠️部分 {partial_chunks}, ❌失敗 {failed_chunks} (成功率: {success_rate:.1f}%)
 
 ## 話者一覧
 """
-        for speaker, info in self.context.speaker_mapping.items():
-            content += f"- **{speaker}**: {info}\n"
+        if self.context.speaker_mapping:
+            for speaker, info in self.context.speaker_mapping.items():
+                content += f"- **{speaker}**: {info}\n"
+        else:
+            content += "話者が識別されませんでした。\n"
 
         if self.context.key_decisions:
             content += "\n## 主要な決定事項\n"
@@ -1059,52 +1201,98 @@ class Voice2Structured:
         content += "\n## 文字起こし内容\n\n"
 
         for result in results:
-            if result["status"] == "completed":
-                start_time = self._format_time(
-                    result["start_time"], self.current_audio_path
+            start_time = self._format_time(
+                result["start_time"], self.current_audio_path
+            )
+            end_time = self._format_time(result["end_time"], self.current_audio_path)
+
+            # チャンクのステータスを表示
+            status_icon = (
+                "✅"
+                if result["status"] == "completed"
+                else "⚠️" if result["status"] == "partial" else "❌"
+            )
+            content += f"### [{start_time} - {end_time}] {status_icon}\n\n"
+
+            if result["status"] == "completed" and result["transcript"]:
+                content += f"{result['transcript']}\n\n"
+            elif result["status"] == "partial" and result["transcript"]:
+                content += f"{result['transcript']}\n\n"
+                content += (
+                    "*（注：この部分は安全性フィルターまたは部分的な処理結果です）*\n\n"
                 )
-                end_time = self._format_time(
-                    result["end_time"], self.current_audio_path
-                )
+            elif result["status"] == "failed":
+                error_info = result.get("error", "不明なエラー")
+                content += f"❌ **処理エラー**: {error_info}\n\n"
+                content += f"*リトライ回数: {result.get('attempts', 'N/A')}回*\n\n"
+            else:
+                content += "この音声チャンクには発話内容が含まれていません。\n\n"
 
-                content += f"""### [{start_time} - {end_time}]
-
-{result['transcript']}
-
-"""
+        # 処理完了の注記
+        if failed_chunks > 0:
+            content += "## 注記\n\n"
+            content += f"⚠️ {failed_chunks}個のチャンクで処理エラーが発生しました。\n"
+            content += "チャンクサイズを小さくするか、音声品質を確認してください。\n\n"
 
         return content
 
     def _generate_lifelog_output(self, results: List[Dict]) -> str:
-        """ライフログモードの出力生成"""
+        """ライフログモードの出力生成（品質統計付き）"""
+        # 処理統計の計算
+        total_chunks = len(results)
+        success_chunks = len([r for r in results if r["status"] == "completed"])
+        partial_chunks = len([r for r in results if r["status"] == "partial"])
+        failed_chunks = len([r for r in results if r["status"] == "failed"])
+        success_rate = (success_chunks / total_chunks * 100) if total_chunks > 0 else 0
+
         content = f"""# ライフログ記録
 
 ## 処理情報
 - 処理日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 - モデル: {self.model_config.name}
-- チャンク数: {len(results)}
+- チャンク数: {total_chunks}
 - 処理モード: ライフログ
+- 処理品質: ✅成功 {success_chunks}, ⚠️部分 {partial_chunks}, ❌失敗 {failed_chunks} (成功率: {success_rate:.1f}%)
 
 ## 時系列ライフログ
 
 """
 
         for result in results:
-            if result["status"] == "completed":
-                start_time = self._format_time(
-                    result["start_time"], self.current_audio_path
+            start_time = self._format_time(
+                result["start_time"], self.current_audio_path
+            )
+            end_time = self._format_time(result["end_time"], self.current_audio_path)
+
+            # チャンクのステータスを表示
+            status_icon = (
+                "✅"
+                if result["status"] == "completed"
+                else "⚠️" if result["status"] == "partial" else "❌"
+            )
+            content += f"### [{start_time} - {end_time}] {status_icon}\n\n"
+
+            if result["status"] == "completed" and result["transcript"]:
+                content += f"{result['transcript']}\n\n"
+            elif result["status"] == "partial" and result["transcript"]:
+                content += f"{result['transcript']}\n\n"
+                content += (
+                    "*（注：この部分は安全性フィルターまたは部分的な処理結果です）*\n\n"
                 )
-                end_time = self._format_time(
-                    result["end_time"], self.current_audio_path
-                )
+            elif result["status"] == "failed":
+                error_info = result.get("error", "不明なエラー")
+                content += f"❌ **処理エラー**: {error_info}\n\n"
+                content += f"*リトライ回数: {result.get('attempts', 'N/A')}回*\n\n"
+            else:
+                content += "（無音区間）\n\n"
 
-                content += f"""### [{start_time} - {end_time}]
+            content += "---\n\n"
 
-{result['transcript']}
-
----
-
-"""
+        # 処理完了の注記
+        if failed_chunks > 0:
+            content += "## 注記\n\n"
+            content += f"⚠️ {failed_chunks}個のチャンクで処理エラーが発生しました。\n"
+            content += "音声品質やファイル形式を確認してください。\n\n"
 
         return content
 
@@ -1125,9 +1313,9 @@ class Voice2Structured:
 
         filename = Path(audio_path).stem
 
-        # パターン: YYYY-MM-DD_HH_MM_SS
-        pattern = r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})_(\d{2})_(\d{2})$"
-        match = re.match(pattern, filename)
+        # パターン: YYYY-MM-DD_HH_MM_SS (プレフィックス/サフィックス対応)
+        pattern = r"(\d{4})-(\d{2})-(\d{2})_(\d{2})_(\d{2})_(\d{2})"
+        match = re.search(pattern, filename)
 
         if match:
             year, month, day, hour, minute, second = map(int, match.groups())
