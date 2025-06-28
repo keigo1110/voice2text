@@ -1,0 +1,207 @@
+# ---------------------------------------------------------------------------
+# Project: voice2structured
+# Purpose: 音声ファイルを2つのパターンで処理する完全自動パイプライン
+#          1. 全文文字起こし（講演・議論用）
+#          2. ライフログ（日常記録用）
+# ---------------------------------------------------------------------------
+
+# 0. ハイレベル概要 ---------------------------------------------------------
+system:
+  name: voice2structured
+  version: 2.0
+  description: |
+    音声ファイルを2つのモードで処理：
+    - transcript: 講演や議論の正確な文字起こし
+    - lifelog: 日常音声から行動推論を含む詳細ライフログ
+
+    動的チャンク分割とローリング要約でGeminiの制限を回避し、
+    長時間音声も処理可能。
+
+# 1. 処理モード -------------------------------------------------------------
+modes:
+  transcript:
+    name: "全文文字起こし"
+    description: "講演、会議、議論などの正確な文字起こし"
+    output_file: "transcript.md"
+    focus: "発話内容の正確な記録"
+
+  lifelog:
+    name: "ライフログ"
+    description: "日常音声から行動推論を含む詳細記録"
+    output_file: "lifelog.md"
+    focus: "音環境分析と行動推論"
+
+# 2. 入出力I/F --------------------------------------------------------------
+io:
+  input:
+    audio_path: "<required>"
+    mode: "transcript" # transcript or lifelog
+  output_dir: "./outputs/${job_id}/"
+
+# 3. 動的チャンク方針 --------------------------------------------------------
+chunk_policy:
+  min_minutes: 15
+  max_minutes: 40
+  target_tokens: 50000
+  hard_token_cap: 60000
+  vad:
+    aggressiveness: 3
+    silence_threshold_sec: 0.8
+
+# 4. Gemini LLM 設定 --------------------------------------------------------
+llm:
+  # Gemini API設定
+  api:
+    # API Key設定（環境変数GOOGLE_API_KEYが優先される）
+    api_key: "" # 空の場合は環境変数GOOGLE_API_KEYを使用
+
+    # APIエンドポイント設定（通常は変更不要）
+    base_url: "" # デフォルトのエンドポイントを使用
+
+    # リクエスト設定
+    timeout_sec: 120
+    max_retries: 3
+
+  # モデル設定
+  model:
+    name: "gemini-2.5-flash"
+    # 代替モデル（メインモデルが利用できない場合）
+    fallback_models:
+      - "gemini-1.5-flash"
+      - "gemini-1.5-pro"
+
+    # 生成設定
+    generation_config:
+      temperature: 0.1
+      top_p: 0.9
+      top_k: 40
+      max_output_tokens: 8192
+
+    # 安全設定
+    safety_settings:
+      # カテゴリごとの安全設定（BLOCK_NONE, BLOCK_ONLY_HIGH, BLOCK_MEDIUM_AND_ABOVE, BLOCK_LOW_AND_ABOVE）
+      HARM_CATEGORY_HARASSMENT: "BLOCK_NONE"
+      HARM_CATEGORY_HATE_SPEECH: "BLOCK_NONE"
+      HARM_CATEGORY_SEXUALLY_EXPLICIT: "BLOCK_NONE"
+      HARM_CATEGORY_DANGEROUS_CONTENT: "BLOCK_NONE"
+
+  # 処理設定
+  processing:
+    max_concurrency: 3
+    rolling_summary_tokens: 1000
+
+    # リトライ設定
+    retry:
+      max_attempts: 5
+      backoff_sec: 2
+      exponential_backoff: true
+
+    # コスト管理
+    cost_guard:
+      budget_usd: 5.0
+      warn_threshold_usd: 4.0
+
+# 5. モード別プロンプト ------------------------------------------------------
+# プロンプト設定は以下のファイルに移行されました：
+# - prompts_transcript.py: 全文文字起こしモード用
+# - prompts_lifelog.py: ライフログモード用
+#
+# 以下の設定は過去バージョンとの互換性のため残してありますが、使用されません。
+# プロンプトの編集は上記のPythonファイルで行ってください。
+
+# prompts:
+#   transcript_mode:
+#     # 全文文字起こしモード
+#     transcript_chunk:
+#       system: |
+#         あなたはプロの文字起こし専門家です。
+#         講演、会議、議論などの音声を正確に文字起こしします。
+#
+#         直近の議論要約: {{rolling_summary}}
+#       user: |
+#         以下の音声を正確に文字起こししてください。
+#
+#         **要件:**
+#         - 話者を区別（自分、Aさん、Bさんなど）
+#         - 正確な発言内容（フィラー語は適度に除去）
+#         - 重要な間や反応も記録
+#         - タイムスタンプ付き
+#
+#         **フォーマット:**
+#         ［MM:SS］ 話者名: 発言内容
+#
+#         {{audio_file_part}}
+#
+#     local_summary:
+#       system: ""
+#       user: |
+#         上記の文字起こしを要約してください（200字以内）：
+#         - 主要な話題・議題
+#         - 重要な発言・決定事項
+#         - 次の話題への流れ
+#
+#   lifelog_mode:
+#     # ライフログモード
+#     transcript_chunk:
+#       system: |
+#         あなたはライフログ分析の専門家です。
+#         ウェアラブルデバイスで録音された日常音声から、
+#         発話だけでなく環境音も分析し、行動を詳細に推論します。
+#
+#         直近の活動要約: {{rolling_summary}}
+#       user: |
+#         以下の音声を分析し、ライフログとして記録してください。
+#
+#         **分析対象:**
+#         - 発話内容（話者区別）
+#         - 環境音（ドア、足音、車、アナウンスなど）
+#         - 行動推論（移動、作業、休憩、食事など）
+#         - 場所推定（可能な場合）
+#
+#         **フォーマット:**
+#         ［HH:MM:SS］ 発話者: 発言内容
+#         ［HH:MM:SS］ (行動: 推論根拠を含む説明)
+#
+#         **注意事項:**
+#         - 衣擦れや微細な音は無視
+#         - 同じ状況の繰り返し記録は避ける
+#         - 状況変化時のみ新しい行動記録
+#         - 推定の確信度が低い場合は「？」を付加
+#
+#         {{audio_file_part}}
+#
+#     local_summary:
+#       system: ""
+#       user: |
+#         上記のライフログを要約してください（200字以内）：
+#         - 主要な活動・行動
+#         - 場所・環境の変化
+#         - 重要なイベントや会話
+#         - 感情・雰囲気
+
+# 6. ストレージパス ---------------------------------------------------------
+storage:
+  root: "./storage"
+  temp_dir: "tmp/"
+  chunks_dir: "chunks/"
+  transcripts_dir: "transcripts/"
+
+# 7. CLI/REST ---------------------------------------------------------------
+cli:
+  transcript: >
+    python v_to_t.py <AUDIO_FILE> --mode transcript
+  lifelog: >
+    python v_to_t.py <AUDIO_FILE> --mode lifelog
+  status: >
+    python v_to_t.py --status
+
+# 8. テスト計画 -------------------------------------------------------------
+tests:
+  transcript_mode:
+    - 講演音声の正確な書き起こし
+    - 複数話者の議論記録
+    - 専門用語の正確な転写
+  lifelog_mode:
+    - 日常活動の行動推論精度
+    - 環境音からの状況判断
+    - タイムライン記録の精度

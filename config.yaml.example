@@ -1,0 +1,87 @@
+# ---------------------------------------------------------------------------
+# Project: voice2structured - 設定ファイルサンプル
+# Purpose: 実際の設定ファイル作成のためのテンプレート
+# ---------------------------------------------------------------------------
+#
+# 使用方法:
+# 1. このファイルをconfig.yamlにコピー
+# 2. 各設定値を環境に合わせて調整
+# 3. GOOGLE_API_KEY環境変数を設定するか、api_keyを入力
+#
+
+# 処理モード設定
+io:
+  input:
+    mode: "transcript"  # transcript or lifelog
+  output_dir: "./outputs/${job_id}/"
+
+# 動的チャンク分割設定
+chunk_policy:
+  min_minutes: 15
+  max_minutes: 40
+  target_tokens: 50000
+  hard_token_cap: 60000
+  vad:
+    aggressiveness: 3
+    silence_threshold_sec: 0.8
+
+# Gemini LLM 設定
+llm:
+  # Gemini API設定
+  api:
+    # API Key設定（環境変数GOOGLE_API_KEYが優先される）
+    api_key: ""  # ここにAPI Keyを入力するか、環境変数GOOGLE_API_KEYを使用
+
+    # APIエンドポイント設定（通常は変更不要）
+    base_url: ""  # デフォルトのエンドポイントを使用
+
+    # リクエスト設定
+    timeout_sec: 120
+    max_retries: 3
+
+  # モデル設定
+  model:
+    name: "gemini-2.5-flash"
+    # 代替モデル（メインモデルが利用できない場合）
+    fallback_models:
+      - "gemini-1.5-flash"
+      - "gemini-1.5-pro"
+
+    # 生成設定
+    generation_config:
+      temperature: 0.1        # 0.0-1.0: 創造性の制御（低い=一貫性、高い=創造性）
+      top_p: 0.9              # 0.0-1.0: トークン選択の多様性
+      top_k: 40               # トップKトークンから選択
+      max_output_tokens: 8192 # 最大出力トークン数
+
+    # 安全設定
+    safety_settings:
+      # カテゴリごとの安全設定
+      # 選択肢: BLOCK_NONE, BLOCK_ONLY_HIGH, BLOCK_MEDIUM_AND_ABOVE, BLOCK_LOW_AND_ABOVE
+      HARM_CATEGORY_HARASSMENT: "BLOCK_NONE"
+      HARM_CATEGORY_HATE_SPEECH: "BLOCK_NONE"
+      HARM_CATEGORY_SEXUALLY_EXPLICIT: "BLOCK_NONE"
+      HARM_CATEGORY_DANGEROUS_CONTENT: "BLOCK_NONE"
+
+  # 処理設定
+  processing:
+    max_concurrency: 3           # 並行処理数
+    rolling_summary_tokens: 1000 # ローリング要約のトークン数
+
+    # リトライ設定
+    retry:
+      max_attempts: 5            # 最大再試行回数
+      backoff_sec: 2             # 再試行間隔（秒）
+      exponential_backoff: true  # 指数バックオフを使用
+
+    # コスト管理
+    cost_guard:
+      budget_usd: 5.0            # 予算上限（USD）
+      warn_threshold_usd: 4.0    # 警告閾値（USD）
+
+# ストレージパス設定
+storage:
+  root: "./storage"
+  temp_dir: "tmp/"
+  chunks_dir: "chunks/"
+  transcripts_dir: "transcripts/"
