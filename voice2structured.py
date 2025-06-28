@@ -96,9 +96,7 @@ class GeminiModelConfig:
     """Geminiモデル設定"""
 
     name: str = "gemini-2.5-flash"
-    fallback_models: List[str] = field(
-        default_factory=lambda: ["gemini-1.5-flash", "gemini-1.5-pro"]
-    )
+    fallback_models: List[str] = field(default_factory=lambda: ["gemini-2.5-pro"])
     generation_config: Dict = field(
         default_factory=lambda: {
             "temperature": 0.1,
@@ -606,10 +604,87 @@ class Voice2Structured:
             raise
 
     def extract_speakers_from_transcript(self, transcript: str) -> List[str]:
-        """トランスクリプトから話者を抽出"""
+        """トランスクリプトから話者を抽出（改良版）"""
+        # 基本的な話者抽出
         speakers = re.findall(r"^([^:：]+)[：:]", transcript, re.MULTILINE)
-        # "自分"以外の話者をフィルタリング
-        return [s.strip() for s in speakers if s.strip() and s.strip() != "自分"]
+
+        # 不適切な話者名をフィルタリング
+        valid_speakers = []
+        for speaker in speakers:
+            speaker = speaker.strip()
+
+            # 基本的な除外条件
+            if not speaker or speaker == "自分":
+                continue
+
+            # 話者名の正規化（環境音やノイズを除去）
+            normalized = self._normalize_speaker_name(speaker)
+            if normalized and self._is_valid_speaker_name(normalized):
+                valid_speakers.append(normalized)
+
+        # 重複を除去しつつ順序を保持
+        seen = set()
+        unique_speakers = []
+        for speaker in valid_speakers:
+            if speaker not in seen:
+                seen.add(speaker)
+                unique_speakers.append(speaker)
+
+        return unique_speakers
+
+    def _normalize_speaker_name(self, speaker: str) -> str:
+        """話者名を正規化"""
+        # 改行を除去
+        speaker = speaker.replace("\n", " ").replace("\r", "")
+
+        # 環境音やノイズのパターンを除去
+        # (笑い), (風の音), (音声が重なる) など
+        speaker = re.sub(r"\([^)]*\)", "", speaker)
+
+        # 余分な空白を除去
+        speaker = " ".join(speaker.split())
+
+        return speaker.strip()
+
+    def _is_valid_speaker_name(self, speaker: str) -> bool:
+        """話者名として有効かどうかを判定"""
+        # 空文字列は無効
+        if not speaker:
+            return False
+
+        # 長すぎる文字列は無効（通常の話者名は20文字以下）
+        if len(speaker) > 20:
+            return False
+
+        # 数字のみは無効
+        if speaker.isdigit():
+            return False
+
+        # システムメッセージパターンは無効
+        system_patterns = [
+            r"^音声を正確に",
+            r"^文字起こし",
+            r"^処理が",
+            r"^エラー",
+            r"^[0-9]+\s*$",  # 数字のみ
+            r"^で、これの続きとして",  # 長い説明文の開始
+        ]
+
+        for pattern in system_patterns:
+            if re.match(pattern, speaker):
+                return False
+
+        # 環境音パターンは無効
+        if any(
+            noise in speaker.lower() for noise in ["風の音", "笑い", "音声が", "重なる"]
+        ):
+            return False
+
+        # 異常に長い文字列（技術説明文など）は無効
+        if len(speaker) > 50:
+            return False
+
+        return True
 
     def extract_key_information(self, transcript: str) -> Dict:
         """トランスクリプトから重要情報を抽出"""
@@ -1135,10 +1210,11 @@ class Voice2Structured:
 
         output_files[self.output_config.mode] = str(output_file)
 
-        # コンテキスト情報も保存
+        # コンテキスト情報も保存（クリーンアップ済み）
         context_file = output_dir / "context.json"
+        cleaned_context = self._clean_context_for_output()
         with open(context_file, "w", encoding="utf-8") as f:
-            json.dump(asdict(self.context), f, ensure_ascii=False, indent=2)
+            json.dump(cleaned_context, f, ensure_ascii=False, indent=2)
         output_files["context"] = str(context_file)
 
         logger.info(f"Generated {self.output_config.mode}: {output_file}")
@@ -1146,17 +1222,47 @@ class Voice2Structured:
         return output_files
 
     def _generate_speaker_info(self) -> Dict:
-        """話者情報を生成"""
-        speaker_info = {
-            "total_speakers": len(self.context.speaker_mapping),
-            "speakers": {},
-        }
+        """話者情報を生成（改良版）"""
+        # 話者データをクリーンアップ
+        cleaned_speaker_mapping = {}
+        cleaned_speaker_descriptions = {}
+        cleaned_last_speakers = []
 
         for speaker, info in self.context.speaker_mapping.items():
+            # 話者名を正規化
+            normalized = self._normalize_speaker_name(speaker)
+            if normalized and self._is_valid_speaker_name(normalized):
+                cleaned_speaker_mapping[normalized] = info
+                cleaned_speaker_descriptions[normalized] = (
+                    self.context.speaker_descriptions.get(speaker, "")
+                )
+
+        # 最近の話者リストもクリーンアップ
+        for speaker in self.context.last_speakers:
+            normalized = self._normalize_speaker_name(speaker)
+            if (
+                normalized
+                and self._is_valid_speaker_name(normalized)
+                and normalized not in cleaned_last_speakers
+            ):
+                cleaned_last_speakers.append(normalized)
+
+        speaker_info = {
+            "total_speakers": len(cleaned_speaker_mapping),
+            "speakers": {},
+            "data_quality": {
+                "original_count": len(self.context.speaker_mapping),
+                "filtered_count": len(cleaned_speaker_mapping),
+                "removed_invalid": len(self.context.speaker_mapping)
+                - len(cleaned_speaker_mapping),
+            },
+        }
+
+        for speaker, info in cleaned_speaker_mapping.items():
             speaker_info["speakers"][speaker] = {
                 "first_appearance": info,
-                "description": self.context.speaker_descriptions.get(speaker, ""),
-                "is_recent": speaker in self.context.last_speakers,
+                "description": cleaned_speaker_descriptions.get(speaker, ""),
+                "is_recent": speaker in cleaned_last_speakers,
             }
 
         return speaker_info
@@ -1394,6 +1500,65 @@ class Voice2Structured:
                 "error": str(e),
                 "processing_time": str(datetime.now() - start_time),
             }
+
+    def _clean_context_for_output(self) -> Dict:
+        """コンテキスト情報をクリーンアップして出力用に準備"""
+        # 話者データをクリーンアップ
+        cleaned_speaker_mapping = {}
+        cleaned_speaker_descriptions = {}
+        cleaned_last_speakers = []
+
+        for speaker, info in self.context.speaker_mapping.items():
+            normalized = self._normalize_speaker_name(speaker)
+            if normalized and self._is_valid_speaker_name(normalized):
+                cleaned_speaker_mapping[normalized] = info
+                cleaned_speaker_descriptions[normalized] = (
+                    self.context.speaker_descriptions.get(speaker, "")
+                )
+
+        # 最近の話者リストもクリーンアップ
+        for speaker in self.context.last_speakers:
+            normalized = self._normalize_speaker_name(speaker)
+            if (
+                normalized
+                and self._is_valid_speaker_name(normalized)
+                and normalized not in cleaned_last_speakers
+            ):
+                cleaned_last_speakers.append(normalized)
+
+        # キートピックを適切にフィルタリング（短すぎるものや不適切なものを除去）
+        cleaned_key_topics = []
+        for topic in self.context.key_topics:
+            if topic and len(topic.strip()) > 20 and len(topic.strip()) < 500:
+                cleaned_key_topics.append(topic.strip())
+
+        # 未解決参照を適切にフィルタリング
+        cleaned_unresolved_references = []
+        valid_refs = ["これ", "それ", "あれ", "その件", "あの件", "先ほどの"]
+        for ref in self.context.unresolved_references:
+            if ref in valid_refs:
+                cleaned_unresolved_references.append(ref)
+
+        # アクションアイテムをクリーンアップ
+        cleaned_action_items = []
+        for item in self.context.action_items:
+            if item.get("content") and len(item["content"].strip()) > 10:
+                cleaned_action_items.append(item)
+
+        cleaned_context = {
+            "rolling_summary": self.context.rolling_summary,
+            "speaker_mapping": cleaned_speaker_mapping,
+            "speaker_descriptions": cleaned_speaker_descriptions,
+            "key_topics": cleaned_key_topics[-10:],  # 最新の10件のみ
+            "unresolved_references": list(
+                set(cleaned_unresolved_references)
+            ),  # 重複除去
+            "key_decisions": self.context.key_decisions[-5:],  # 最新の5件のみ
+            "action_items": cleaned_action_items[-10:],  # 最新の10件のみ
+            "current_topic": self.context.current_topic,
+            "last_speakers": cleaned_last_speakers[-5:],  # 最新の5人のみ
+        }
+        return cleaned_context
 
 
 def main():
